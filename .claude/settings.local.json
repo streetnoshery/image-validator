@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(run)",
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(npm --version)",
+      "Bash(npm run *)",
+      "Bash(curl -s -m 5 http://localhost:4000/health)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(powershell -Command \"Get-Process node -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,StartTime\")",
+      "Bash(npm install *)",
+      "Bash(node -e \"process.chdir\\('node_modules/@tensorflow/tfjs-node'\\); try { require\\('./dist/index.js'\\); console.log\\('OK'\\); } catch\\(e\\) { console.log\\('ERR:', e.message\\); }\")",
+      "Bash(node node_modules/@tensorflow/tfjs-node/scripts/deps-stage.js symlink node_modules/@tensorflow/tfjs-node)",
+      "Bash(node -e \"try { const tf = require\\('@tensorflow/tfjs-node'\\); console.log\\('OK', tf.version.tfjs\\); } catch\\(e\\) { console.log\\('ERR:', e.message\\); }\")",
+      "Bash(node -e \"const m = require\\('./models/ssd_mobilenetv1_model-weights_manifest.json'\\); console.log\\(JSON.stringify\\(m.map\\(g => g.paths\\), null, 2\\)\\)\")",
+      "Bash(curl -s -m 5 http://localhost:3000/)",
+      "Bash(curl -s -m 10 http://localhost:4000/api/images/stats)"
+    ]
+  }
+}

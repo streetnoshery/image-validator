@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: image_validator
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO (S3-compatible local object storage) ──────────────────────────────
+  # Access the web console at http://localhost:9001
+  #   Username : minioadmin
+  #   Password : minioadmin
+  #
+  # The bucket "images" is created automatically by the mc init service below.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API  → used by the backend
+      - "9001:9001"   # Web UI  → open in browser to browse uploaded images
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO bucket initialiser (runs once, then exits) ────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/images &&
+        mc anonymous set download local/images &&
+        echo 'MinIO bucket ready.'
+      "
+
+volumes:
+  pgdata:
+  miniodata:
