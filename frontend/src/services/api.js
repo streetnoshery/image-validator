@@ -1,9 +1,80 @@
 import axios from 'axios';
 
+const TOKEN_STORAGE_KEY = 'image_validator_token';
+
+let authToken = null;
+try {
+  authToken = localStorage.getItem(TOKEN_STORAGE_KEY);
+} catch {
+  // Private browsing / storage disabled — sessions just won't persist
+  // across reloads, which is a degraded-but-safe fallback.
+}
+
+/** @param {string|null} token */
+export function setAuthToken(token) {
+  authToken = token;
+  try {
+    if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function getAuthToken() {
+  return authToken;
+}
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 120000, // 2 min for large uploads
 });
+
+api.interceptors.request.use((config) => {
+  if (authToken) config.headers.Authorization = `Bearer ${authToken}`;
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      setAuthToken(null);
+      // AuthContext listens for this to reset to the logged-out state —
+      // an event instead of a direct import to avoid a circular
+      // api.js <-> AuthContext.jsx dependency.
+      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+    }
+    return Promise.reject(error);
+  }
+);
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
+
+/**
+ * @param {string} email
+ * @param {string} password
+ */
+export async function register(email, password) {
+  const response = await api.post('/auth/register', { email, password });
+  return response.data;
+}
+
+/**
+ * @param {string} email
+ * @param {string} password
+ */
+export async function login(email, password) {
+  const response = await api.post('/auth/login', { email, password });
+  return response.data;
+}
+
+export async function fetchMe() {
+  const response = await api.get('/auth/me');
+  return response.data;
+}
+
+// ─── Images ────────────────────────────────────────────────────────────────
 
 /**
  * Upload images with progress tracking.
@@ -70,6 +141,14 @@ export async function deleteImage(id) {
  */
 export async function fetchStats() {
   const response = await api.get('/images/stats');
+  return response.data;
+}
+
+/**
+ * Adopt any images left ownerless from before accounts existed.
+ */
+export async function claimOrphanedImages() {
+  const response = await api.post('/images/claim');
   return response.data;
 }
 

@@ -8,6 +8,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 const imageRoutes = require('./routes/images');
+const authRoutes = require('./routes/auth');
 const errorHandler = require('./middleware/errorHandler');
 const logger = require('./config/logger');
 const db = require('./config/database');
@@ -56,6 +57,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
+app.use('/api/auth', authRoutes);
 app.use('/api/images', uploadLimiter, imageRoutes);
 
 // 404 catch-all

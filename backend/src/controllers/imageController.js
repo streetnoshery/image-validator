@@ -2,7 +2,7 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const Image = require('../models/Image');
 const { analyzeImage, checkSimilarity } = require('../services/imageProcessingService');
-const { uploadFile, deleteFile, buildPublicUrl } = require('../services/storageService');
+const { uploadFile, deleteFile, getPresignedUrl } = require('../services/storageService');
 const uploadQueue = require('../services/uploadQueue');
 const Mutex = require('../utils/Mutex');
 const logger = require('../config/logger');
@@ -11,7 +11,10 @@ const logger = require('../config/logger');
 // register it" critical section across ALL concurrently-processed jobs
 // (not just within one batch) — without this, two similar images queued
 // at the same time could both pass the duplicate check before either one
-// registers its hash.
+// registers its hash. One mutex for the whole process is fine even
+// across users: it only ever compares a job against its OWN user's
+// hash list (see Image.getAllPhashes), so it's not a cross-user
+// bottleneck in practice, just a tiny serialized critical section.
 const similarityMutex = new Mutex();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -40,14 +43,28 @@ function detectMimeType(buf, declaredMime) {
 }
 
 /**
- * Build the S3 key for a stored image.
+ * Build the S3 key for a stored image, namespaced under the owning user
+ * so objects are organized per-account even though the bucket itself
+ * has no public policy to rely on for isolation.
+ * @param {string} userId
  * @param {string} status - 'accepted' | 'rejected'
  * @param {string} filename
  * @returns {string}
  */
-function buildS3Key(status, filename) {
+function buildS3Key(userId, status, filename) {
   const folder = status === 'accepted' ? 'accepted' : 'rejected';
-  return `images/${folder}/${filename}`;
+  return `images/${userId}/${folder}/${filename}`;
+}
+
+/**
+ * Replace a row's `s3_url` with a freshly-minted short-lived signed URL
+ * (the bucket is private — nothing is servable without one). Applied at
+ * the response layer, not persisted, so a leaked API response can't
+ * grant standing access.
+ */
+async function withPresignedUrl(image) {
+  if (!image.s3_key || image.s3_key === 'pending') return image;
+  return { ...image, s3_url: await getPresignedUrl(image.s3_key) };
 }
 
 /**
@@ -56,11 +73,12 @@ function buildS3Key(status, filename) {
  * errors are caught here so one bad file can't take down the worker or
  * leave its DB row stuck at "queued".
  * @param {{
- *   fileId: string, buffer: Buffer, mimeType: string, fileSize: number,
- *   originalName: string, sharedPhashes: Array<{id: string, phash: string}>
+ *   fileId: string, userId: string, buffer: Buffer, mimeType: string,
+ *   fileSize: number, originalName: string,
+ *   sharedPhashes: Array<{id: string, phash: string}>
  * }} job
  */
-async function processQueuedFile({ fileId, buffer, mimeType, fileSize, originalName, sharedPhashes }) {
+async function processQueuedFile({ fileId, userId, buffer, mimeType, fileSize, originalName, sharedPhashes }) {
   try {
     const analysis = await analyzeImage(buffer, mimeType, fileSize);
     const rejectionReasons = [...analysis.rejectionReasons];
@@ -85,17 +103,18 @@ async function processQueuedFile({ fileId, buffer, mimeType, fileSize, originalN
 
     const status = rejectionReasons.length === 0 ? 'accepted' : 'rejected';
     const storedFilename = `${fileId}.${analysis.extension}`;
-    const s3Key = buildS3Key(status, storedFilename);
+    const s3Key = buildS3Key(userId, status, storedFilename);
 
-    const s3Url = await uploadFile(analysis.processedBuffer, s3Key, analysis.processedMime, {
+    await uploadFile(analysis.processedBuffer, s3Key, analysis.processedMime, {
       originalName,
       status,
+      userId,
     });
 
-    const updated = await Image.update(fileId, {
+    const updated = await Image.update(fileId, userId, {
       stored_filename: storedFilename,
       s3_key: s3Key,
-      s3_url: s3Url,
+      s3_url: s3Key, // placeholder — real URLs are signed fresh per-read, see withPresignedUrl()
       mime_type: analysis.processedMime,
       width: analysis.width,
       height: analysis.height,
@@ -113,7 +132,7 @@ async function processQueuedFile({ fileId, buffer, mimeType, fileSize, originalN
     return updated;
   } catch (err) {
     logger.error(`Failed to process ${originalName}: ${err.message}`);
-    await Image.update(fileId, {
+    await Image.update(fileId, userId, {
       status: 'rejected',
       rejection_reasons: [`Processing error: ${err.message}`],
     }).catch((updateErr) => {
@@ -126,10 +145,11 @@ async function processQueuedFile({ fileId, buffer, mimeType, fileSize, originalN
 
 /**
  * POST /api/images/upload
- * Accepts one or more images, records them immediately, and hands
- * validation/storage off to the background queue — the response does
- * NOT wait for processing to finish. Poll GET /api/images/batch?ids=
- * (or GET /api/images/:id) for results.
+ * Accepts one or more images, records them immediately under the
+ * authenticated user, and hands validation/storage off to the
+ * background queue — the response does NOT wait for processing to
+ * finish. Poll GET /api/images/batch?ids= (or GET /api/images/:id) for
+ * results.
  */
 async function uploadImages(req, res) {
   const files = req.files;
@@ -137,10 +157,13 @@ async function uploadImages(req, res) {
     return res.status(400).json({ success: false, error: 'No files uploaded.' });
   }
 
-  // Seed with existing accepted-image hashes ONCE; jobs mutate this same
-  // array (under similarityMutex) as they complete, so later files in the
-  // batch — and files from other concurrent requests — see each other.
-  const sharedPhashes = await Image.getAllPhashes();
+  const userId = req.user.id;
+
+  // Seed with this user's existing accepted-image hashes ONCE; jobs
+  // mutate this same array (under similarityMutex) as they complete, so
+  // later files in the batch — and other concurrent requests from this
+  // same user — see each other. Never includes other users' hashes.
+  const sharedPhashes = await Image.getAllPhashes(userId);
 
   const queued = [];
 
@@ -149,12 +172,10 @@ async function uploadImages(req, res) {
     const originalName = path.basename(file.originalname);
     const mimeType = detectMimeType(file.buffer, file.mimetype);
 
-    // Isolate one file's DB failure from the rest of the batch — without
-    // this, a single bad insert would throw out of the loop and fail the
-    // whole request, even for files already recorded successfully.
     try {
       await Image.create({
         id: fileId,
+        user_id: userId,
         original_filename: originalName,
         stored_filename: fileId,
         s3_key: 'pending',
@@ -180,6 +201,7 @@ async function uploadImages(req, res) {
       .add(() =>
         processQueuedFile({
           fileId,
+          userId,
           buffer: file.buffer,
           mimeType,
           fileSize: file.size,
@@ -197,7 +219,7 @@ async function uploadImages(req, res) {
       mimeType,
     });
 
-    logger.info(`Queued: ${originalName} (${mimeType}, ${file.size} bytes)`);
+    logger.info(`Queued: ${originalName} (${mimeType}, ${file.size} bytes) for user ${userId}`);
   }
 
   res.status(202).json({
@@ -209,7 +231,10 @@ async function uploadImages(req, res) {
 
 /**
  * GET /api/images/batch?ids=a,b,c
- * Poll processing status for a set of images in one request.
+ * Poll processing status for a batch of images owned by the
+ * authenticated user — ids for other users' images are silently
+ * dropped rather than 404ing individually, so a guessed id can't be
+ * used to probe for existence.
  */
 async function getBatchStatus(req, res) {
   const idsParam = req.query.ids;
@@ -223,25 +248,29 @@ async function getBatchStatus(req, res) {
     .filter(Boolean)
     .slice(0, 100);
 
-  const images = await Image.findByIds(ids);
-  res.json({ success: true, images });
+  const images = await Image.findByIds(ids, req.user.id);
+  const withUrls = await Promise.all(images.map(withPresignedUrl));
+  res.json({ success: true, images: withUrls });
 }
 
 /**
  * GET /api/images
- * List images with optional status filter and pagination.
+ * List the authenticated user's own images, with optional status filter
+ * and pagination.
  */
 async function listImages(req, res) {
   const { status, page = 1, limit = 20 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
+  const userId = req.user.id;
 
-  const images = await Image.findAll({
+  const images = await Image.findAll(userId, {
     status: status || undefined,
     limit: parseInt(limit),
     offset,
   });
+  const withUrls = await Promise.all(images.map(withPresignedUrl));
 
-  const stats = await Image.countByStatus();
+  const stats = await Image.countByStatus(userId);
   const statsMap = stats.reduce((acc, { status: s, count }) => {
     acc[s] = parseInt(count);
     return acc;
@@ -249,7 +278,7 @@ async function listImages(req, res) {
 
   res.json({
     success: true,
-    images,
+    images: withUrls,
     pagination: { page: parseInt(page), limit: parseInt(limit) },
     stats: statsMap,
   });
@@ -257,32 +286,29 @@ async function listImages(req, res) {
 
 /**
  * GET /api/images/:id
- * Fetch a single image by ID, with a fresh pre-signed URL.
+ * Fetch a single image by ID (must be owned by the authenticated user),
+ * with a fresh signed URL.
  */
 async function getImage(req, res) {
   const { id } = req.params;
-  const image = await Image.findById(id);
+  const image = await Image.findById(id, req.user.id);
 
   if (!image) {
     return res.status(404).json({ success: false, error: 'Image not found.' });
   }
 
-  // Return public MinIO URL directly (bucket is public read)
-  let presignedUrl = image.s3_url;
-  if (image.s3_key && image.s3_key !== 'pending') {
-    presignedUrl = buildPublicUrl(image.s3_key);
-  }
-
-  res.json({ success: true, image: { ...image, previewUrl: presignedUrl } });
+  const withUrl = await withPresignedUrl(image);
+  res.json({ success: true, image: { ...withUrl, previewUrl: withUrl.s3_url } });
 }
 
 /**
  * DELETE /api/images/:id
- * Remove image from S3 and database.
+ * Remove an image (must be owned by the authenticated user) from
+ * storage and the database.
  */
 async function deleteImage(req, res) {
   const { id } = req.params;
-  const image = await Image.findById(id);
+  const image = await Image.findById(id, req.user.id);
 
   if (!image) {
     return res.status(404).json({ success: false, error: 'Image not found.' });
@@ -291,23 +317,34 @@ async function deleteImage(req, res) {
   if (image.s3_key && image.s3_key !== 'pending') {
     await deleteFile(image.s3_key);
   }
-  await Image.delete(id);
+  await Image.delete(id, req.user.id);
 
   res.json({ success: true, message: 'Image deleted.' });
 }
 
 /**
  * GET /api/images/stats
- * Return upload statistics.
+ * Return the authenticated user's own upload statistics.
  */
 async function getStats(req, res) {
-  const stats = await Image.countByStatus();
+  const stats = await Image.countByStatus(req.user.id);
   const statsMap = stats.reduce((acc, { status, count }) => {
     acc[status] = parseInt(count);
     return acc;
   }, {});
 
   res.json({ success: true, stats: statsMap });
+}
+
+/**
+ * POST /api/images/claim
+ * One-time convenience: adopt any images left ownerless by rows created
+ * before authentication existed. Idempotent — a row can only be claimed
+ * once, by whichever authenticated user calls this first.
+ */
+async function claimOrphaned(req, res) {
+  const claimed = await Image.claimOrphaned(req.user.id);
+  res.json({ success: true, claimed });
 }
 
 module.exports = {
@@ -317,4 +354,5 @@ module.exports = {
   getImage,
   deleteImage,
   getStats,
+  claimOrphaned,
 };

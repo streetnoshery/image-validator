@@ -92,6 +92,8 @@ npm run dev        # http://localhost:3000
 | `STORAGE_BUCKET` | `images` | Bucket name |
 | `MAX_FILE_SIZE_MB` | `20` | Max upload size |
 | `FRONTEND_URL` | `http://localhost:3000` | CORS origin |
+| `JWT_SECRET` | *(random dev fallback)* | **Required in production** — signs session tokens. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `JWT_EXPIRES_IN` | `7d` | Session token lifetime |
 
 ---
 
@@ -99,13 +101,31 @@ npm run dev        # http://localhost:3000
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/images/upload` | Queue images for processing (multipart, field: `images`). Returns **202** immediately with `{ queued: [{id, status: 'queued'}] }` — does not wait for validation. |
-| `GET` | `/api/images/batch?ids=a,b,c` | Poll processing status for a batch of ids (used by the frontend while waiting on the queue) |
-| `GET` | `/api/images` | List images (`?status=accepted\|rejected&page=1&limit=20`) |
-| `GET` | `/api/images/stats` | Counts by status |
-| `GET` | `/api/images/:id` | Single image |
-| `DELETE` | `/api/images/:id` | Delete image |
+| `POST` | `/api/auth/register` | Create an account — `{ email, password }` (password ≥ 8 chars). Returns `{ token, user }`. |
+| `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }`. Same generic error for a wrong password and a nonexistent email (no account enumeration). |
+| `GET` | `/api/auth/me` | Current account for the bearer token. |
+| `POST` | `/api/images/upload` | **Auth required.** Queue images for processing (multipart, field: `images`). Returns **202** immediately with `{ queued: [{id, status: 'queued'}] }` — does not wait for validation. |
+| `GET` | `/api/images/batch?ids=a,b,c` | **Auth required.** Poll processing status for a batch of ids (used by the frontend while waiting on the queue) |
+| `GET` | `/api/images` | **Auth required.** List the caller's own images (`?status=accepted\|rejected&page=1&limit=20`) |
+| `GET` | `/api/images/stats` | **Auth required.** Counts by status, for the caller |
+| `GET` | `/api/images/:id` | **Auth required.** Single image, must be owned by the caller (404 otherwise) |
+| `DELETE` | `/api/images/:id` | **Auth required.** Delete an image, must be owned by the caller |
+| `POST` | `/api/images/claim` | **Auth required.** One-time: adopt any images left ownerless from before accounts existed. Idempotent. |
 | `GET` | `/health` | Health check |
+
+Every `/api/images/*` route requires `Authorization: Bearer <token>` from `/api/auth/login` or `/api/auth/register`.
+
+---
+
+## Auth & per-user privacy
+
+Every image belongs to exactly one account (`images.user_id`, enforced at the query layer — see `src/models/Image.js`, where every read/write takes `userId` and filters or matches on it). There is no admin bypass: `GET/DELETE /api/images/:id` for an image you don't own returns a plain 404, not a 403 — wrong-owner and doesn't-exist are indistinguishable from the outside, so ids can't be used to probe what exists. Passwords are hashed with bcrypt (`bcryptjs`, 10 rounds); sessions are JWTs (`jsonwebtoken`, 7-day expiry, `JWT_SECRET` in `.env`) sent as `Authorization: Bearer <token>` and checked by `requireAuth` middleware in front of every images route.
+
+**Storage privacy, not just app-level auth:** the MinIO bucket has no public-read policy — `docker-compose.yml`'s `minio-init` no longer runs `mc anonymous set download`. Every image URL the API returns is a short-lived (15 min) presigned S3 GET URL minted fresh per request (`getPresignedUrl` in `src/services/storageService.js`), never persisted. Object keys are also namespaced per user (`images/<userId>/accepted|rejected/<file>`). So even someone with a leaked/logged image URL loses access once it expires, and can't derive other users' objects from a key pattern.
+
+**Duplicate detection is per-user, not global** — `Image.getAllPhashes(userId)` only ever compares a new upload against that same user's own accepted images, so one user's private photo can never cause (or be inferred from) another user's upload being rejected as "too similar."
+
+**Pre-auth data:** rows created before accounts existed have `user_id = NULL` and are invisible to every query until claimed. `POST /api/images/claim` assigns all currently-ownerless rows to the calling account — the frontend calls this automatically right after your first login/register, so any images from before you had an account just show up in your gallery once you sign in.
 
 ---
 

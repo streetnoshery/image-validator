@@ -1,7 +1,7 @@
 /**
- * In-memory stand-in for the Knex-backed Image model, used by the
- * controller integration test so it doesn't need a real Postgres
- * instance. Mirrors the subset of Image.js the controller calls.
+ * In-memory stand-in for the Knex-backed Image model, used by
+ * controller integration tests so they don't need a real Postgres
+ * instance. Mirrors the user-scoped signatures of Image.js.
  */
 const store = new Map();
 
@@ -12,43 +12,60 @@ const fakeImageModel = {
     return row;
   },
 
-  async findAll({ status, limit = 50, offset = 0 } = {}) {
-    let rows = [...store.values()];
+  async findAll(userId, { status, limit = 50, offset = 0 } = {}) {
+    let rows = [...store.values()].filter((r) => r.user_id === userId);
     if (status) rows = rows.filter((r) => r.status === status);
     rows.sort((a, b) => b.created_at - a.created_at);
     return rows.slice(offset, offset + limit);
   },
 
-  async findById(id) {
-    return store.get(id);
+  async findById(id, userId) {
+    const row = store.get(id);
+    return row && row.user_id === userId ? row : undefined;
   },
 
-  async findByIds(ids) {
-    return ids.map((id) => store.get(id)).filter(Boolean);
+  async findByIds(ids, userId) {
+    return ids.map((id) => store.get(id)).filter((row) => row && row.user_id === userId);
   },
 
-  async update(id, data) {
+  async update(id, userId, data) {
     const existing = store.get(id);
-    if (!existing) return undefined;
+    if (!existing || existing.user_id !== userId) return undefined;
     const updated = { ...existing, ...data, updated_at: new Date() };
     store.set(id, updated);
     return updated;
   },
 
-  async delete(id) {
+  async delete(id, userId) {
+    const existing = store.get(id);
+    if (!existing || existing.user_id !== userId) return 0;
     return store.delete(id) ? 1 : 0;
   },
 
-  async getAllPhashes() {
+  async getAllPhashes(userId) {
     return [...store.values()]
-      .filter((r) => r.phash && r.status !== 'rejected')
+      .filter((r) => r.user_id === userId && r.phash && r.status !== 'rejected')
       .map((r) => ({ id: r.id, phash: r.phash }));
   },
 
-  async countByStatus() {
+  async countByStatus(userId) {
     const counts = {};
-    for (const r of store.values()) counts[r.status] = (counts[r.status] || 0) + 1;
+    for (const r of store.values()) {
+      if (r.user_id !== userId) continue;
+      counts[r.status] = (counts[r.status] || 0) + 1;
+    }
     return Object.entries(counts).map(([status, count]) => ({ status, count: String(count) }));
+  },
+
+  async claimOrphaned(userId) {
+    let claimed = 0;
+    for (const row of store.values()) {
+      if (row.user_id == null) {
+        row.user_id = userId;
+        claimed++;
+      }
+    }
+    return claimed;
   },
 
   /** Test-only helpers */

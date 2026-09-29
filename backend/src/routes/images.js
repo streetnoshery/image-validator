@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const upload = require('../middleware/upload');
 const requireFaceModels = require('../middleware/requireFaceModels');
+const requireAuth = require('../middleware/requireAuth');
 const {
   uploadImages,
   getBatchStatus,
@@ -9,7 +10,13 @@ const {
   getImage,
   deleteImage,
   getStats,
+  claimOrphaned,
 } = require('../controllers/imageController');
+
+// Every route in this file is private to the authenticated caller —
+// applied once here rather than per-route so a new route can't be added
+// later and accidentally left open.
+router.use(requireAuth);
 
 /**
  * POST /api/images/upload
@@ -21,7 +28,7 @@ router.post('/upload', requireFaceModels, upload.array('images', 10), uploadImag
 
 /**
  * GET /api/images/stats
- * Aggregated upload statistics.
+ * Aggregated upload statistics for the authenticated user.
  */
 router.get('/stats', getStats);
 
@@ -30,6 +37,12 @@ router.get('/stats', getStats);
  * Poll processing status for a batch of images.
  */
 router.get('/batch', getBatchStatus);
+
+/**
+ * POST /api/images/claim
+ * Adopt any images left ownerless from before auth existed.
+ */
+router.post('/claim', claimOrphaned);
 
 /**
  * GET /api/images

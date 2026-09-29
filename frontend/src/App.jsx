@@ -3,7 +3,9 @@ import { Toaster } from 'react-hot-toast';
 import { UploadSection } from './components/UploadSection';
 import { ResultsSection } from './components/ResultsSection';
 import { GallerySection } from './components/GallerySection';
+import { AuthScreen } from './components/AuthScreen';
 import { useImageUpload } from './hooks/useImageUpload';
+import { useAuth } from './context/AuthContext';
 
 const TABS = [
   { id: 'upload', label: '⬆️ Upload' },
@@ -11,7 +13,40 @@ const TABS = [
 ];
 
 export default function App() {
+  const { status } = useAuth();
+
+  if (status === 'checking') {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: 'var(--color-text-muted)',
+          fontSize: 14,
+        }}
+      >
+        Loading…
+      </div>
+    );
+  }
+
+  if (status === 'anonymous') {
+    return (
+      <>
+        <Toaster position="top-right" />
+        <AuthScreen />
+      </>
+    );
+  }
+
+  return <AuthenticatedApp />;
+}
+
+function AuthenticatedApp() {
   const [activeTab, setActiveTab] = useState('upload');
+  const { user, logout } = useAuth();
 
   const {
     files,
@@ -49,6 +84,8 @@ export default function App() {
             alignItems: 'center',
             justifyContent: 'space-between',
             height: 60,
+            gap: 16,
+            flexWrap: 'wrap',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -63,28 +100,55 @@ export default function App() {
             </div>
           </div>
 
-          {/* Tabs */}
-          <nav style={{ display: 'flex', gap: 4 }}>
-            {TABS.map((tab) => (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+            {/* Tabs */}
+            <nav style={{ display: 'flex', gap: 4 }}>
+              {TABS.map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  style={{
+                    padding: '6px 18px',
+                    borderRadius: 8,
+                    border: 'none',
+                    backgroundColor: activeTab === tab.id ? 'var(--color-primary)' : 'transparent',
+                    color: activeTab === tab.id ? '#fff' : 'var(--color-text-muted)',
+                    fontSize: 14,
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </nav>
+
+            {/* Account */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span
+                style={{ fontSize: 12, color: 'var(--color-text-muted)' }}
+                title={user?.email}
+              >
+                {user?.email}
+              </span>
               <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={logout}
                 style={{
-                  padding: '6px 18px',
+                  padding: '6px 14px',
                   borderRadius: 8,
-                  border: 'none',
-                  backgroundColor: activeTab === tab.id ? 'var(--color-primary)' : 'transparent',
-                  color: activeTab === tab.id ? '#fff' : 'var(--color-text-muted)',
-                  fontSize: 14,
+                  border: '1px solid var(--color-border)',
+                  backgroundColor: 'var(--color-surface)',
+                  color: 'var(--color-text-muted)',
+                  fontSize: 13,
                   fontWeight: 500,
                   cursor: 'pointer',
-                  transition: 'all 0.15s',
                 }}
               >
-                {tab.label}
+                Log out
               </button>
-            ))}
-          </nav>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -162,7 +226,7 @@ export default function App() {
             <div style={{ marginBottom: 28 }}>
               <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 6 }}>Image Gallery</h2>
               <p style={{ color: 'var(--color-text-muted)', fontSize: 14 }}>
-                All previously uploaded images stored in MinIO.
+                Your uploaded images — private to your account.
               </p>
             </div>
             <GallerySection />

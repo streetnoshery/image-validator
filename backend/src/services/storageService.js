@@ -1,16 +1,9 @@
-const { PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { storageClient, STORAGE_BUCKET } = require('../config/storage');
 const logger = require('../config/logger');
 
-const ENDPOINT = process.env.STORAGE_ENDPOINT || 'http://localhost:9000';
-
-/**
- * Public URL for a stored object.
- * MinIO path-style: http://localhost:9000/<bucket>/<key>
- */
-function buildPublicUrl(key) {
-  return `${ENDPOINT}/${STORAGE_BUCKET}/${key}`;
-}
+const DEFAULT_PRESIGN_TTL_SECONDS = 15 * 60; // 15 minutes
 
 /**
  * Upload a buffer to MinIO.
@@ -18,7 +11,8 @@ function buildPublicUrl(key) {
  * @param {string} key
  * @param {string} mimeType
  * @param {object} [metadata]
- * @returns {Promise<string>} public URL
+ * @returns {Promise<string>} the key (callers already have it — returned
+ *   for convenience/logging, not as a usable URL: the bucket is private)
  */
 async function uploadFile(buffer, key, mimeType, metadata = {}) {
   await storageClient.send(
@@ -30,9 +24,8 @@ async function uploadFile(buffer, key, mimeType, metadata = {}) {
       Metadata: metadata,
     })
   );
-  const url = buildPublicUrl(key);
   logger.debug(`Stored: ${key}`);
-  return url;
+  return key;
 }
 
 /**
@@ -46,4 +39,20 @@ async function deleteFile(key) {
   logger.debug(`Deleted: ${key}`);
 }
 
-module.exports = { uploadFile, deleteFile, buildPublicUrl };
+/**
+ * Generate a short-lived, signed GET URL for a private object. The
+ * bucket has no public/anonymous read policy — this is the only way to
+ * view a stored image, and it's minted fresh on every read endpoint
+ * response rather than persisted, so access can't outlive the request
+ * that legitimately asked for it (scoped by requireAuth + Image model's
+ * per-user queries upstream of this call).
+ * @param {string} key
+ * @param {number} [expiresInSeconds]
+ * @returns {Promise<string>}
+ */
+async function getPresignedUrl(key, expiresInSeconds = DEFAULT_PRESIGN_TTL_SECONDS) {
+  const command = new GetObjectCommand({ Bucket: STORAGE_BUCKET, Key: key });
+  return getSignedUrl(storageClient, command, { expiresIn: expiresInSeconds });
+}
+
+module.exports = { uploadFile, deleteFile, getPresignedUrl };

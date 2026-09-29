@@ -1,12 +1,22 @@
 const request = require('supertest');
 
+const TEST_USER = { id: 'test-user-1', email: 'test@example.com' };
+
 jest.mock('../src/models/Image', () => require('./mocks/fakeImageModel'));
 
 jest.mock('../src/services/storageService', () => ({
-  uploadFile: jest.fn(async (buffer, key) => `http://fake-storage/${key}`),
+  uploadFile: jest.fn(async (buffer, key) => key),
   deleteFile: jest.fn(async () => {}),
-  buildPublicUrl: jest.fn((key) => `http://fake-storage/${key}`),
+  getPresignedUrl: jest.fn(async (key) => `http://fake-storage/${key}?signed=1`),
 }));
+
+// This suite tests the queueing/mutex orchestration, not auth itself
+// (see auth.test.js and imageOwnership.test.js for that) — stub the
+// authenticated user directly rather than minting real JWTs everywhere.
+jest.mock('../src/middleware/requireAuth', () => (req, res, next) => {
+  req.user = TEST_USER;
+  next();
+});
 
 // Fully mocked (no jest.requireActual) so this suite doesn't pull in
 // canvas/face-api/tfjs-node — the pixel-math is covered separately in
@@ -137,7 +147,12 @@ describe('GET /api/images/batch', () => {
   });
 
   test('returns only the rows that exist, ignoring unknown ids', async () => {
-    await fakeImageModel.create({ id: 'x1', status: 'accepted', original_filename: 'x1.jpg' });
+    await fakeImageModel.create({
+      id: 'x1',
+      user_id: TEST_USER.id,
+      status: 'accepted',
+      original_filename: 'x1.jpg',
+    });
 
     const res = await request(app).get('/api/images/batch').query({ ids: 'x1,does-not-exist' });
 
