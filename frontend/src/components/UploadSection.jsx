@@ -25,12 +25,14 @@ export function UploadSection({
   onClear,
 }) {
   const isUploading = uploadState === 'uploading';
+  const isProcessing = uploadState === 'processing';
+  const isBusy = isUploading || isProcessing;
   const hasFiles = files.length > 0;
   const pendingCount = files.filter((f) => f.status === 'pending').length;
 
   return (
     <section>
-      <DropZone onFilesSelected={onFilesAdded} disabled={isUploading} />
+      <DropZone onFilesSelected={onFilesAdded} disabled={isBusy} />
 
       {hasFiles && (
         <>
@@ -54,7 +56,7 @@ export function UploadSection({
             <div style={{ display: 'flex', gap: 10 }}>
               <button
                 onClick={onClear}
-                disabled={isUploading}
+                disabled={isBusy}
                 style={{
                   padding: '8px 18px',
                   borderRadius: 8,
@@ -63,7 +65,7 @@ export function UploadSection({
                   color: 'var(--color-text-muted)',
                   fontSize: 14,
                   fontWeight: 500,
-                  opacity: isUploading ? 0.4 : 1,
+                  opacity: isBusy ? 0.4 : 1,
                 }}
               >
                 Clear all
@@ -71,17 +73,16 @@ export function UploadSection({
 
               <button
                 onClick={onStartUpload}
-                disabled={isUploading || pendingCount === 0}
+                disabled={isBusy || pendingCount === 0}
                 style={{
                   padding: '8px 24px',
                   borderRadius: 8,
                   border: 'none',
-                  backgroundColor:
-                    isUploading || pendingCount === 0 ? '#a5b4fc' : 'var(--color-primary)',
+                  backgroundColor: isBusy || pendingCount === 0 ? '#a5b4fc' : 'var(--color-primary)',
                   color: '#fff',
                   fontSize: 14,
                   fontWeight: 600,
-                  cursor: isUploading || pendingCount === 0 ? 'not-allowed' : 'pointer',
+                  cursor: isBusy || pendingCount === 0 ? 'not-allowed' : 'pointer',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 8,
@@ -92,6 +93,11 @@ export function UploadSection({
                   <>
                     <Spinner />
                     Uploading… {uploadProgress}%
+                  </>
+                ) : isProcessing ? (
+                  <>
+                    <Spinner />
+                    Processing…
                   </>
                 ) : (
                   `Upload ${pendingCount > 0 ? pendingCount : ''} image${pendingCount !== 1 ? 's' : ''}`

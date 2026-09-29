@@ -1,8 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const upload = require('../middleware/upload');
+const requireFaceModels = require('../middleware/requireFaceModels');
 const {
   uploadImages,
+  getBatchStatus,
   listImages,
   getImage,
   deleteImage,
@@ -12,14 +14,22 @@ const {
 /**
  * POST /api/images/upload
  * Upload one or more images (multipart/form-data, field name: "images").
+ * Queues them for background processing and returns 202 immediately —
+ * poll GET /api/images/batch?ids= for results.
  */
-router.post('/upload', upload.array('images', 10), uploadImages);
+router.post('/upload', requireFaceModels, upload.array('images', 10), uploadImages);
 
 /**
  * GET /api/images/stats
  * Aggregated upload statistics.
  */
 router.get('/stats', getStats);
+
+/**
+ * GET /api/images/batch?ids=a,b,c
+ * Poll processing status for a batch of images.
+ */
+router.get('/batch', getBatchStatus);
 
 /**
  * GET /api/images

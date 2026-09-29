@@ -37,6 +37,17 @@ export async function fetchImages(params = {}) {
 }
 
 /**
+ * Poll processing status for a batch of images by id — used while the
+ * server processes uploads asynchronously in the background.
+ * @param {string[]} ids
+ */
+export async function fetchImagesBatch(ids) {
+  if (ids.length === 0) return { success: true, images: [] };
+  const response = await api.get('/images/batch', { params: { ids: ids.join(',') } });
+  return response.data;
+}
+
+/**
  * Fetch single image.
  * @param {string} id
  */

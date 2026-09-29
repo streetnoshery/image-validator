@@ -1,9 +1,18 @@
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const Image = require('../models/Image');
-const { validateAndProcess } = require('../services/imageProcessingService');
+const { analyzeImage, checkSimilarity } = require('../services/imageProcessingService');
 const { uploadFile, deleteFile, buildPublicUrl } = require('../services/storageService');
+const uploadQueue = require('../services/uploadQueue');
+const Mutex = require('../utils/Mutex');
 const logger = require('../config/logger');
+
+// Serializes the "check perceptual hash against known hashes, then
+// register it" critical section across ALL concurrently-processed jobs
+// (not just within one batch) — without this, two similar images queued
+// at the same time could both pass the duplicate check before either one
+// registers its hash.
+const similarityMutex = new Mutex();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -41,11 +50,86 @@ function buildS3Key(status, filename) {
   return `images/${folder}/${filename}`;
 }
 
+/**
+ * Run the full validation + storage pipeline for one queued file, then
+ * persist the result. Runs on the background queue (see uploadQueue.js) —
+ * errors are caught here so one bad file can't take down the worker or
+ * leave its DB row stuck at "queued".
+ * @param {{
+ *   fileId: string, buffer: Buffer, mimeType: string, fileSize: number,
+ *   originalName: string, sharedPhashes: Array<{id: string, phash: string}>
+ * }} job
+ */
+async function processQueuedFile({ fileId, buffer, mimeType, fileSize, originalName, sharedPhashes }) {
+  try {
+    const analysis = await analyzeImage(buffer, mimeType, fileSize);
+    const rejectionReasons = [...analysis.rejectionReasons];
+
+    const release = await similarityMutex.lock();
+    try {
+      if (analysis.phash) {
+        const { isSimilar, matchId, distance } = checkSimilarity(analysis.phash, sharedPhashes);
+        if (isSimilar) {
+          rejectionReasons.push(
+            `Too similar to an existing image (id: ${matchId}, distance: ${distance})`
+          );
+        } else if (rejectionReasons.length === 0) {
+          // Only register hashes for images that end up accepted — matches
+          // Image.getAllPhashes(), which excludes rejected images too.
+          sharedPhashes.push({ id: fileId, phash: analysis.phash });
+        }
+      }
+    } finally {
+      release();
+    }
+
+    const status = rejectionReasons.length === 0 ? 'accepted' : 'rejected';
+    const storedFilename = `${fileId}.${analysis.extension}`;
+    const s3Key = buildS3Key(status, storedFilename);
+
+    const s3Url = await uploadFile(analysis.processedBuffer, s3Key, analysis.processedMime, {
+      originalName,
+      status,
+    });
+
+    const updated = await Image.update(fileId, {
+      stored_filename: storedFilename,
+      s3_key: s3Key,
+      s3_url: s3Url,
+      mime_type: analysis.processedMime,
+      width: analysis.width,
+      height: analysis.height,
+      status,
+      rejection_reasons: rejectionReasons.length ? rejectionReasons : null,
+      phash: analysis.phash,
+      blur_score: analysis.blurScore,
+      face_count: analysis.faceCount,
+      metadata: analysis.metadata,
+    });
+
+    logger.info(
+      `${originalName} -> ${status}${rejectionReasons.length ? ` (${rejectionReasons.join('; ')})` : ''}`
+    );
+    return updated;
+  } catch (err) {
+    logger.error(`Failed to process ${originalName}: ${err.message}`);
+    await Image.update(fileId, {
+      status: 'rejected',
+      rejection_reasons: [`Processing error: ${err.message}`],
+    }).catch((updateErr) => {
+      logger.error(`Also failed to mark ${fileId} as rejected: ${updateErr.message}`);
+    });
+  }
+}
+
 // ─── Controllers ─────────────────────────────────────────────────────────────
 
 /**
  * POST /api/images/upload
- * Accepts one or more images, runs validation pipeline, stores results.
+ * Accepts one or more images, records them immediately, and hands
+ * validation/storage off to the background queue — the response does
+ * NOT wait for processing to finish. Poll GET /api/images/batch?ids=
+ * (or GET /api/images/:id) for results.
  */
 async function uploadImages(req, res) {
   const files = req.files;
@@ -53,24 +137,23 @@ async function uploadImages(req, res) {
     return res.status(400).json({ success: false, error: 'No files uploaded.' });
   }
 
-  // Fetch existing hashes ONCE for similarity comparison across entire batch
-  const existingPhashes = await Image.getAllPhashes();
+  // Seed with existing accepted-image hashes ONCE; jobs mutate this same
+  // array (under similarityMutex) as they complete, so later files in the
+  // batch — and files from other concurrent requests — see each other.
+  const sharedPhashes = await Image.getAllPhashes();
 
-  const results = [];
+  const queued = [];
 
   for (const file of files) {
     const fileId = uuidv4();
     const originalName = path.basename(file.originalname);
-    let dbRecord = null;
+    const mimeType = detectMimeType(file.buffer, file.mimetype);
 
+    // Isolate one file's DB failure from the rest of the batch — without
+    // this, a single bad insert would throw out of the loop and fail the
+    // whole request, even for files already recorded successfully.
     try {
-      // Detect actual MIME (handles HEIC misreported as octet-stream)
-      const mimeType = detectMimeType(file.buffer, file.mimetype);
-
-      logger.info(`Processing: ${originalName} (${mimeType}, ${file.size} bytes)`);
-
-      // ── Create an initial DB record with "processing" status ────────────
-      dbRecord = await Image.create({
+      await Image.create({
         id: fileId,
         original_filename: originalName,
         stored_filename: fileId,
@@ -78,106 +161,70 @@ async function uploadImages(req, res) {
         s3_url: 'pending',
         mime_type: mimeType,
         file_size: file.size,
-        status: 'processing',
+        status: 'queued',
       });
-
-      // ── Run validation + processing ──────────────────────────────────────
-      const validationResult = await validateAndProcess(
-        file.buffer,
-        mimeType,
-        file.size,
-        existingPhashes
-      );
-
-      const {
-        accepted,
-        rejectionReasons,
-        processedBuffer,
-        processedMime,
-        extension,
-        width,
-        height,
-        blurScore,
-        faceCount,
-        phash,
-        metadata,
-      } = validationResult;
-
-      const status = accepted ? 'accepted' : 'rejected';
-      const storedFilename = `${fileId}.${extension}`;
-      const s3Key = buildS3Key(status, storedFilename);
-
-      // ── Upload (processed/converted) buffer to MinIO ────────────────────
-      const s3Url = await uploadFile(processedBuffer, s3Key, processedMime, {
-        originalName,
-        status,
-      });
-
-      // ── Update DB record ─────────────────────────────────────────────────
-      const updated = await Image.update(fileId, {
-        stored_filename: storedFilename,
-        s3_key: s3Key,
-        s3_url: s3Url,
-        mime_type: processedMime,
-        width,
-        height,
-        status,
-        rejection_reasons: rejectionReasons.length ? rejectionReasons : null,
-        phash,
-        blur_score: blurScore,
-        face_count: faceCount,
-        metadata,
-      });
-
-      // Add newly accepted hashes so subsequent files in THIS batch also check against it
-      if (accepted && phash) {
-        existingPhashes.push({ id: fileId, phash });
-      }
-
-      results.push({
-        id: updated.id,
-        originalFilename: originalName,
-        status,
-        rejectionReasons,
-        previewUrl: s3Url,
-        width,
-        height,
-        mimeType: processedMime,
-        fileSize: file.size,
-        blurScore,
-        faceCount,
-      });
-
-      logger.info(`${originalName} → ${status}${rejectionReasons.length ? ` (${rejectionReasons.join('; ')})` : ''}`);
     } catch (err) {
-      logger.error(`Failed to process ${originalName}:`, err);
-
-      // Mark as rejected with error if DB record was created
-      if (dbRecord) {
-        await Image.update(fileId, {
-          status: 'rejected',
-          rejection_reasons: [`Processing error: ${err.message}`],
-        }).catch(() => {});
-      }
-
-      results.push({
+      logger.error(`Failed to record ${originalName}: ${err.message}`);
+      queued.push({
         id: fileId,
         originalFilename: originalName,
         status: 'rejected',
-        rejectionReasons: [`Processing error: ${err.message}`],
-        error: true,
+        rejectionReasons: [`Failed to record upload: ${err.message}`],
+        fileSize: file.size,
+        mimeType,
       });
+      continue;
     }
+
+    uploadQueue
+      .add(() =>
+        processQueuedFile({
+          fileId,
+          buffer: file.buffer,
+          mimeType,
+          fileSize: file.size,
+          originalName,
+          sharedPhashes,
+        })
+      )
+      .catch((err) => logger.error(`Queue job crashed for ${originalName}: ${err.message}`));
+
+    queued.push({
+      id: fileId,
+      originalFilename: originalName,
+      status: 'queued',
+      fileSize: file.size,
+      mimeType,
+    });
+
+    logger.info(`Queued: ${originalName} (${mimeType}, ${file.size} bytes)`);
   }
 
-  const accepted = results.filter((r) => r.status === 'accepted');
-  const rejected = results.filter((r) => r.status === 'rejected');
-
-  res.status(200).json({
+  res.status(202).json({
     success: true,
-    summary: { total: results.length, accepted: accepted.length, rejected: rejected.length },
-    results,
+    message: 'Files queued for processing.',
+    queued,
   });
+}
+
+/**
+ * GET /api/images/batch?ids=a,b,c
+ * Poll processing status for a set of images in one request.
+ */
+async function getBatchStatus(req, res) {
+  const idsParam = req.query.ids;
+  if (!idsParam) {
+    return res.status(400).json({ success: false, error: 'ids query parameter is required.' });
+  }
+
+  const ids = idsParam
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 100);
+
+  const images = await Image.findByIds(ids);
+  res.json({ success: true, images });
 }
 
 /**
@@ -263,4 +310,11 @@ async function getStats(req, res) {
   res.json({ success: true, stats: statsMap });
 }
 
-module.exports = { uploadImages, listImages, getImage, deleteImage, getStats };
+module.exports = {
+  uploadImages,
+  getBatchStatus,
+  listImages,
+  getImage,
+  deleteImage,
+  getStats,
+};

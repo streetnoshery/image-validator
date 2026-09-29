@@ -4,6 +4,7 @@ import { formatFileSize } from '../utils/fileValidation';
 const statusConfig = {
   pending: { color: 'var(--color-text-muted)', bg: '#f1f5f9', label: 'Ready to upload', icon: '⏳' },
   uploading: { color: '#2563eb', bg: '#eff6ff', label: 'Uploading…', icon: '⬆️' },
+  queued: { color: '#7c3aed', bg: '#f5f3ff', label: 'Processing…', icon: '⚙️' },
   accepted: { color: 'var(--color-success)', bg: 'var(--color-success-light)', label: 'Accepted', icon: '✅' },
   rejected: { color: 'var(--color-error)', bg: 'var(--color-error-light)', label: 'Rejected', icon: '❌' },
   'client-error': { color: 'var(--color-error)', bg: 'var(--color-error-light)', label: 'Invalid file', icon: '⛔' },

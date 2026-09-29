@@ -19,6 +19,7 @@ const MIN_FACE_RATIO      = 0.05;      // face bounding box must be ≥5% of ima
 
 let faceapi = null;
 let faceModelsLoaded = false;
+let faceModelsLoadPromise = null;
 
 async function loadFaceModels() {
   if (faceModelsLoaded) return true;
@@ -48,8 +49,41 @@ async function loadFaceModels() {
   }
 }
 
+/**
+ * Kick off model loading once (memoized) — called at module load and
+ * reusable by the readiness middleware so concurrent callers share
+ * the same in-flight load instead of racing separate calls.
+ */
+function ensureFaceModelsLoading() {
+  if (!faceModelsLoadPromise) {
+    faceModelsLoadPromise = loadFaceModels().catch((err) => {
+      logger.warn(`Face model load failed: ${err.message}`);
+      return false;
+    });
+  }
+  return faceModelsLoadPromise;
+}
+
+function isFaceModelsReady() {
+  return faceModelsLoaded;
+}
+
+/**
+ * Wait (bounded) for face models to finish loading. Used by the
+ * upload route so a request arriving during the brief startup window
+ * doesn't get silently processed without a face check — see
+ * middleware/requireFaceModels.js.
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>}
+ */
+async function waitForFaceModels(timeoutMs = 5000) {
+  if (faceModelsLoaded) return true;
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs));
+  return Promise.race([ensureFaceModelsLoading(), timeout]);
+}
+
 // Kick off model loading at startup (non-blocking)
-loadFaceModels().catch(() => {});
+ensureFaceModelsLoading();
 
 // ─── HEIC conversion ──────────────────────────────────────────────────────────
 
@@ -172,11 +206,30 @@ function checkSimilarity(newHash, existingHashes) {
 // ─── Local face detection (face-api.js + canvas) ─────────────────────────────
 
 /**
+ * Pure filter: keep only detections whose bounding box covers at least
+ * MIN_FACE_RATIO of the image in both dimensions. Extracted from
+ * detectFaces() so the sizing rule can be unit-tested without loading
+ * the CNN models.
+ * @param {Array<{box: {width: number, height: number}}>} detections
+ * @param {number} imageWidth
+ * @param {number} imageHeight
+ * @returns {Array}
+ */
+function filterValidFaces(detections, imageWidth, imageHeight) {
+  if (!imageWidth || !imageHeight) return [];
+  return detections.filter((d) => {
+    const bw = d.box.width  / imageWidth;
+    const bh = d.box.height / imageHeight;
+    return bw >= MIN_FACE_RATIO && bh >= MIN_FACE_RATIO;
+  });
+}
+
+/**
  * Detect faces entirely on-device using SSD MobileNet v1.
  * Returns { faceCount, hasTooSmallFace, available }
  */
 async function detectFaces(buffer, imageWidth, imageHeight) {
-  const ready = await loadFaceModels();
+  const ready = await ensureFaceModelsLoading();
   if (!ready) {
     return { faceCount: -1, hasTooSmallFace: false, available: false };
   }
@@ -194,13 +247,7 @@ async function detectFaces(buffer, imageWidth, imageHeight) {
     const w = imageWidth  || img.width;
     const h = imageHeight || img.height;
 
-    // Filter out faces whose bounding box is too small relative to the image
-    const validFaces = detections.filter((d) => {
-      const bw = d.box.width  / w;
-      const bh = d.box.height / h;
-      return bw >= MIN_FACE_RATIO && bh >= MIN_FACE_RATIO;
-    });
-
+    const validFaces = filterValidFaces(detections, w, h);
     const hasTooSmallFace = detections.length > 0 && validFaces.length === 0;
 
     return {
@@ -217,7 +264,14 @@ async function detectFaces(buffer, imageWidth, imageHeight) {
 
 // ─── Main validation pipeline ─────────────────────────────────────────────────
 
-async function validateAndProcess(rawBuffer, originalMime, fileSize, existingPhashes = []) {
+/**
+ * Run every validation rule EXCEPT duplicate/similarity detection, which
+ * requires cross-referencing an in-flight batch's other jobs and is
+ * checked separately by the caller under a mutex (see imageController.js) —
+ * doing it here would race when multiple uploads are processed concurrently
+ * by the background queue.
+ */
+async function analyzeImage(rawBuffer, originalMime, fileSize) {
   const rejectionReasons = [];
 
   // 1. Minimum file size
@@ -249,30 +303,28 @@ async function validateAndProcess(rawBuffer, originalMime, fileSize, existingPha
     );
   }
 
-  // 5. Duplicate / similarity
+  // 5. Perceptual hash (used by the caller for the duplicate check)
   const phash = await computePhash(buffer);
-  const { isSimilar, matchId, distance } = checkSimilarity(phash, existingPhashes);
-  if (isSimilar) {
-    rejectionReasons.push(
-      `Too similar to an existing image (id: ${matchId}, distance: ${distance})`
-    );
-  }
 
   // 6. Face detection (local — no cloud service)
+  // Fail CLOSED: if the models aren't available, we cannot verify rules
+  // 5/6 of the spec (face-too-small / multiple-faces), so the image is
+  // rejected rather than silently accepted without that check having run.
+  // In normal operation this path shouldn't be reached at all — the
+  // requireFaceModels middleware blocks uploads until models are ready —
+  // this is defense in depth for any race at process startup.
   const { faceCount, hasTooSmallFace, available } = await detectFaces(buffer, width, height);
-  if (available) {
-    if (faceCount === 0) {
-      rejectionReasons.push('No face detected in the image');
-    } else if (hasTooSmallFace) {
-      rejectionReasons.push('Detected face is too small within the image');
-    } else if (faceCount > 1) {
-      rejectionReasons.push(`Multiple faces detected (${faceCount})`);
-    }
+  if (!available) {
+    rejectionReasons.push('Face detection temporarily unavailable — please retry your upload.');
+  } else if (faceCount === 0) {
+    rejectionReasons.push('No face detected in the image');
+  } else if (hasTooSmallFace) {
+    rejectionReasons.push('Detected face is too small within the image');
+  } else if (faceCount > 1) {
+    rejectionReasons.push(`Multiple faces detected (${faceCount})`);
   }
-  // If models aren't loaded yet, face check is skipped (non-blocking)
 
   return {
-    accepted: rejectionReasons.length === 0,
     rejectionReasons,
     processedBuffer: buffer,
     processedMime:   mimeType,
@@ -291,15 +343,19 @@ async function validateAndProcess(rawBuffer, originalMime, fileSize, existingPha
 }
 
 module.exports = {
-  validateAndProcess,
+  analyzeImage,
   computePhash,
   hammingDistance,
   checkSimilarity,
   calculateBlurScore,
   detectFaces,
+  filterValidFaces,
   normaliseImage,
+  isFaceModelsReady,
+  waitForFaceModels,
   BLUR_THRESHOLD,
   SIMILARITY_THRESHOLD,
   MIN_WIDTH,
   MIN_HEIGHT,
+  MIN_FACE_RATIO,
 };

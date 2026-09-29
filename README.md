@@ -2,6 +2,8 @@
 
 A full-stack image upload and validation app. **Runs entirely locally — no AWS account or cloud credentials needed.**
 
+> **S3 note:** the assignment asks for "Amazon S3 or an equivalent cloud storage service." This project uses **MinIO**, a self-hosted, S3-API-compatible object store (same `@aws-sdk/client-s3` client Amazon S3 uses — `PutObjectCommand`/`DeleteObjectCommand`). Swapping to real S3 is a config-only change: point `STORAGE_ENDPOINT` at `https://s3.<region>.amazonaws.com`, drop `forcePathStyle` in `src/config/storage.js`, and supply real AWS credentials.
+
 ## Architecture
 
 ```
@@ -97,9 +99,31 @@ npm run dev        # http://localhost:3000
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/images/upload` | Upload images (multipart, field: `images`) |
+| `POST` | `/api/images/upload` | Queue images for processing (multipart, field: `images`). Returns **202** immediately with `{ queued: [{id, status: 'queued'}] }` — does not wait for validation. |
+| `GET` | `/api/images/batch?ids=a,b,c` | Poll processing status for a batch of ids (used by the frontend while waiting on the queue) |
 | `GET` | `/api/images` | List images (`?status=accepted\|rejected&page=1&limit=20`) |
 | `GET` | `/api/images/stats` | Counts by status |
 | `GET` | `/api/images/:id` | Single image |
 | `DELETE` | `/api/images/:id` | Delete image |
 | `GET` | `/health` | Health check |
+
+---
+
+## Async processing
+
+Uploads no longer block on the full validation pipeline. `POST /upload` writes a `queued` row per file and hands each one to an in-process, concurrency-limited queue (`src/services/uploadQueue.js`, default concurrency `3`, tune via `UPLOAD_CONCURRENCY`); the response returns as soon as files are recorded. The frontend polls `GET /api/images/batch` every 1.5s until every file reaches `accepted`/`rejected`.
+
+Because multiple files can now be validated concurrently, the duplicate-image check (which reads and mutates a shared list of known perceptual hashes) is serialized through a small async mutex (`src/utils/Mutex.js`) so two similar images processed at the same instant can't both slip past rule 3.
+
+**Face detection is fail-closed.** The upload route is gated by `requireFaceModels` middleware — while the SSD MobileNet model is still loading (a few seconds after server start), uploads get a `503` with `Retry-After` rather than silently skipping the face-size/multiple-face checks. If model loading fails outright, the validation pipeline itself also rejects with "Face detection temporarily unavailable" as a second line of defense.
+
+---
+
+## Tests
+
+```bash
+cd backend
+npm test
+```
+
+Covers: blur/pHash/similarity math, the face-bounding-box size filter, the `AsyncQueue`/`Mutex` primitives, and an integration test against the upload + batch-status endpoints (with DB/storage/model-loading mocked) that asserts the upload response returns *before* background processing finishes, and that two similar images uploaded in the same batch don't both get accepted.

@@ -87,6 +87,10 @@ async function start() {
   }
 }
 
-start();
+// Don't touch the real DB / bind a port when the app is required by tests —
+// tests import `app` for supertest and mock out the DB-touching modules.
+if (process.env.NODE_ENV !== 'test') {
+  start();
+}
 
 module.exports = app; // for testing

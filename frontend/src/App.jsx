@@ -147,7 +147,7 @@ export default function App() {
               onClear={clearFiles}
             />
 
-            {uploadState === 'done' && (
+            {(uploadState === 'processing' || uploadState === 'done') && (
               <ResultsSection
                 accepted={accepted}
                 rejected={rejected}
